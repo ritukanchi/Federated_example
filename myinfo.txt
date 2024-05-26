@@ -1,0 +1,334 @@
+Sure, let's go through your code step by step to understand how each part works.
+
+### Importing Required Libraries
+
+```python
+import argparse
+import warnings
+from collections import OrderedDict
+
+from flwr.client import NumPyClient, ClientApp
+from flwr_datasets import FederatedDataset
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision.transforms import Compose, Normalize, ToTensor
+from tqdm import tqdm
+```
+
+- `argparse`: Used for parsing command-line arguments.
+- `warnings`: Used to filter warnings.
+- `OrderedDict`: A dictionary subclass that remembers the order in which its contents are added.
+- `NumPyClient`, `ClientApp`: Part of the Flower library used for federated learning.
+- `FederatedDataset`: Used to handle federated datasets.
+- `torch`, `nn`, `F`: PyTorch libraries for deep learning.
+- `DataLoader`: PyTorch utility for loading datasets.
+- `Compose`, `Normalize`, `ToTensor`: Transforms from the torchvision library.
+- `tqdm`: Used for displaying progress bars.
+
+### Device Configuration
+
+```python
+warnings.filterwarnings("ignore", category=UserWarning)
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+```
+
+- Suppresses user warnings.
+- Configures the device to use GPU if available; otherwise, it uses the CPU.
+
+### Defining the Model
+
+```python
+class Net(nn.Module):
+    """Model (simple CNN adapted from 'PyTorch: A 60 Minute Blitz')"""
+
+    def __init__(self) -> None:
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+```
+
+- Defines a simple Convolutional Neural Network (CNN).
+- `conv1` and `conv2`: Convolutional layers.
+- `pool`: Max pooling layer.
+- `fc1`, `fc2`, `fc3`: Fully connected layers.
+- `forward`: Defines the forward pass of the model.
+
+### Training Function
+
+```python
+def train(net, trainloader, epochs):
+    """Train the model on the training set."""
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+    for _ in range(epochs):
+        for batch in tqdm(trainloader, "Training"):
+            images = batch["img"]
+            labels = batch["label"]
+            optimizer.zero_grad()
+            criterion(net(images.to(DEVICE)), labels.to(DEVICE)).backward()
+            optimizer.step()
+```
+
+- `train`: Trains the model.
+- `criterion`: Loss function (Cross Entropy Loss).
+- `optimizer`: Optimization algorithm (Stochastic Gradient Descent).
+- Iterates over the dataset for a specified number of epochs.
+- For each batch, it performs forward and backward passes and updates the model parameters.
+
+### Testing Function
+
+```python
+def test(net, testloader):
+    """Validate the model on the test set."""
+    criterion = torch.nn.CrossEntropyLoss()
+    correct, loss = 0, 0.0
+    with torch.no_grad():
+        for batch in tqdm(testloader, "Testing"):
+            images = batch["img"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+            outputs = net(images)
+            loss += criterion(outputs, labels).item()
+            correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
+    accuracy = correct / len(testloader.dataset)
+    return loss, accuracy
+```
+
+- `test`: Evaluates the model.
+- Uses the same loss function.
+- Disables gradient computation for efficiency (`torch.no_grad()`).
+- Calculates loss and accuracy over the test dataset.
+
+### Loading Data
+
+```python
+def load_data(partition_id):
+    """Load partition CIFAR10 data."""
+    fds = FederatedDataset(dataset="cifar10", partitioners={"train": 3})
+    partition = fds.load_partition(partition_id)
+    # Divide data on each node: 80% train, 20% test
+    partition_train_test = partition.train_test_split(test_size=0.2, seed=42)
+    pytorch_transforms = Compose(
+        [ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+    )
+
+    def apply_transforms(batch):
+        """Apply transforms to the partition from FederatedDataset."""
+        batch["img"] = [pytorch_transforms(img) for img in batch["img"]]
+        return batch
+
+    partition_train_test = partition_train_test.with_transform(apply_transforms)
+    trainloader = DataLoader(partition_train_test["train"], batch_size=32, shuffle=True)
+    testloader = DataLoader(partition_train_test["test"], batch_size=32)
+    return trainloader, testloader
+```
+
+- `load_data`: Loads partitioned CIFAR-10 data.
+- `FederatedDataset`: Handles the federated dataset.
+- `partition_train_test`: Splits the data into training and testing sets (80% train, 20% test).
+- `apply_transforms`: Applies transformations to images (converts to tensor and normalizes).
+- Returns data loaders for training and testing.
+
+### Parsing Command-Line Arguments
+
+```python
+parser = argparse.ArgumentParser(description="Flower")
+parser.add_argument(
+    "--partition-id",
+    choices=[0, 1, 2],
+    default=0,
+    type=int,
+    help="Partition of the dataset divided into 3 iid partitions created artificially.",
+)
+partition_id = parser.parse_known_args()[0].partition_id
+```
+
+- Sets up argument parsing for the partition ID.
+- Allows selecting which data partition to use.
+
+### Loading Model and Data
+
+```python
+net = Net().to(DEVICE)
+trainloader, testloader = load_data(partition_id=partition_id)
+```
+
+- Initializes the model and moves it to the appropriate device.
+- Loads the data based on the selected partition.
+
+### Defining Flower Client
+
+```python
+class FlowerClient(NumPyClient):
+    def get_parameters(self, config):
+        return [val.cpu().numpy() for _, val in net.state_dict().items()]
+
+    def set_parameters(self, parameters):
+        params_dict = zip(net.state_dict().keys(), parameters)
+        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+        net.load_state_dict(state_dict, strict=True)
+
+    def fit(self, parameters, config):
+        self.set_parameters(parameters)
+        train(net, trainloader, epochs=1)
+        return self.get_parameters(config={}), len(trainloader.dataset), {}
+
+    def evaluate(self, parameters, config):
+        self.set_parameters(parameters)
+        loss, accuracy = test(net, testloader)
+        return loss, len(testloader.dataset), {"accuracy": accuracy}
+```
+
+- `FlowerClient`: Custom client for federated learning with Flower.
+- `get_parameters`: Returns model parameters as a list of numpy arrays.
+- `set_parameters`: Sets model parameters from a list of numpy arrays.
+- `fit`: Trains the model for one epoch and returns updated parameters.
+- `evaluate`: Evaluates the model and returns the loss and accuracy.
+
+### Client Function
+
+```python
+def client_fn(cid: str):
+    """Create and return an instance of Flower `Client`."""
+    return FlowerClient().to_client()
+```
+
+- Creates and returns an instance of the `FlowerClient`.
+
+### Flower ClientApp
+
+```python
+app = ClientApp(
+    client_fn=client_fn,
+)
+```
+
+- Creates a `ClientApp` instance using the client function.
+
+### Main Function
+
+```python
+if __name__ == "__main__":
+    from flwr.client import start_client
+
+    start_client(
+        server_address="127.0.0.1:8080",
+        client=FlowerClient().to_client(),
+    )
+```
+
+- If the script is run directly, it starts the Flower client, connecting to the specified server address.
+
+This code sets up a federated learning client using Flower, with a simple CNN for CIFAR-10, handling model training, evaluation, and parameter exchange in a federated learning setting.
+
+
+
+server
+
+
+Certainly! Let's go through your server-side code step by step to understand each part in detail.
+
+### Importing Required Libraries
+
+```python
+from typing import List, Tuple
+
+from flwr.server import ServerApp, ServerConfig
+from flwr.server.strategy import FedAvg
+from flwr.common import Metrics
+```
+
+- `typing`: Used for type annotations. `List` and `Tuple` are used to specify the types of certain parameters.
+- `ServerApp`, `ServerConfig`: Part of Flower, these are used to configure and run the federated learning server.
+- `FedAvg`: A strategy in Flower for federated averaging, which aggregates model updates from clients.
+- `Metrics`: A type from Flower used to represent performance metrics like accuracy.
+
+### Defining Metric Aggregation Function
+
+```python
+def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
+    # Multiply accuracy of each client by number of examples used
+    accuracies = [num_examples * m["accuracy"] for num_examples, m in metrics]
+    examples = [num_examples for num_examples, _ in metrics]
+
+    # Aggregate and return custom metric (weighted average)
+    return {"accuracy": sum(accuracies) / sum(examples)}
+```
+
+- `weighted_average`: A function that calculates the weighted average of the accuracy from multiple clients.
+  - `metrics`: A list of tuples where each tuple contains the number of examples and the metrics from a client.
+  - `accuracies`: Computes the weighted accuracies by multiplying each client's accuracy by the number of examples they provided.
+  - `examples`: Extracts the number of examples from each client.
+  - Returns the weighted average accuracy.
+
+### Defining Strategy
+
+```python
+strategy = FedAvg(evaluate_metrics_aggregation_fn=weighted_average)
+```
+
+- `FedAvg`: An instance of the federated averaging strategy.
+- `evaluate_metrics_aggregation_fn`: Sets the metric aggregation function to the `weighted_average` function defined earlier.
+
+### Defining Server Configuration
+
+```python
+config = ServerConfig(num_rounds=3)
+```
+
+- `ServerConfig`: Configuration for the federated learning server.
+- `num_rounds`: Specifies the number of federated learning rounds to be conducted.
+
+### Creating Flower ServerApp
+
+```python
+app = ServerApp(
+    config=config,
+    strategy=strategy,
+)
+```
+
+- `ServerApp`: Creates an instance of the federated learning server application.
+- `config`: Passes the server configuration.
+- `strategy`: Passes the federated averaging strategy with the custom metric aggregation function.
+
+### Running the Server in Legacy Mode
+
+```python
+if __name__ == "__main__":
+    from flwr.server import start_server
+
+    start_server(
+        server_address="0.0.0.0:8080",
+        config=config,
+        strategy=strategy,
+    )
+```
+
+- `__name__ == "__main__"`: Ensures that this block of code runs only if the script is executed directly (not imported as a module).
+- `start_server`: Starts the federated learning server.
+  - `server_address`: Specifies the server address (listens on all interfaces at port 8080).
+  - `config`: Uses the server configuration defined earlier.
+  - `strategy`: Uses the federated averaging strategy defined earlier.
+
+### Summary
+
+- **Importing Libraries**: Sets up the necessary imports for federated learning with Flower.
+- **Defining Metric Aggregation Function**: Implements a custom function to calculate the weighted average accuracy from client metrics.
+- **Defining Strategy**: Sets up the federated averaging strategy and links it to the custom metric aggregation function.
+- **Configuring Server**: Configures the server to run for a specified number of rounds.
+- **Creating ServerApp**: Initializes the federated learning server application with the defined configuration and strategy.
+- **Running the Server**: Starts the server, allowing clients to connect and participate in federated learning.
